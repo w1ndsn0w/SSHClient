@@ -1,0 +1,76 @@
+# IDE settings and local workspace state
+.idea/
+.vscode/
+.vs/
+*.iml
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# CMake build directories and fetched dependencies
+/cmake-build-*/
+/build/
+/build-*/
+/out/
+/Debug/
+/Release/
+CMakeFiles/
+CMakeCache.txt
+CMakeUserPresets.json
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+_deps/
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Generated installer packages (upload these to GitHub Releases)
+/dist/
+
+# Compiled binaries, libraries, and debug symbols
+*.exe
+*.dll
+*.o
+*.obj
+*.a
+*.lib
+*.res
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.pch
+*.gch
+
+# Local connection settings and credentials
+settings.ini
+profiles.ini
+hostkeys.ini
+.env
+.env.*
+!.env.example
+!.env.sample
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.pem
+*.key
+*.ppk
+
+# Logs, partial downloads, and editor temporary files
+*.log
+*.part
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# Operating system metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
