@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 
 #include "sftp_client.h"
 #include "server_profiles.h"
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
@@ -24,9 +26,9 @@ constexpr UINT WM_RESULT = WM_APP + 1;
 constexpr UINT WM_HOST_KEY = WM_APP + 2;
 constexpr UINT WM_PROGRESS = WM_APP + 3;
 enum ControlId { HOST = 101, PORT, USER, PASSWORD, CONNECT, DISCONNECT, REMOTE_PATH, GO,
-                 UP, REFRESH, PREVIEW, DOWNLOAD, LOCAL_PATH, BROWSE, FILES, CONTENT, STATUS,
+                 UP, REFRESH, PREVIEW, DOWNLOAD, UPLOAD, DELETE_REMOTE, LOCAL_PATH, BROWSE, FILES, CONTENT, STATUS,
                  PROFILE_COMBO, PROFILE_NAME, SAVE_PROFILE, DELETE_PROFILE };
-enum class Action { Connect, Disconnect, List, Preview, Download };
+enum class Action { Connect, Disconnect, List, Preview, Download, Upload, Delete };
 
 struct Request {
     Action action;
@@ -34,6 +36,7 @@ struct Request {
     std::string path;
     std::filesystem::path local;
     std::vector<RemoteEntry> selected;
+    std::vector<std::filesystem::path> localPaths; // for upload
 };
 struct Result {
     Action action;
@@ -44,6 +47,11 @@ struct Result {
     std::vector<RemoteEntry> entries;
     std::string error;
     std::filesystem::path local;
+};
+struct ProgressData {
+    std::wstring message;
+    std::uint64_t transferred;
+    std::uint64_t total;
 };
 
 std::wstring wide(const std::string& text) {
@@ -108,7 +116,7 @@ private:
     HWND window_{};
     HWND profileCombo_{}, profileName_{}, saveProfile_{}, deleteProfile_{};
     HWND host_{}, port_{}, user_{}, password_{}, connect_{}, disconnect_{}, remotePath_{}, go_{};
-    HWND up_{}, refresh_{}, preview_{}, download_{}, localPath_{}, browse_{}, files_{}, content_{}, status_{};
+    HWND up_{}, refresh_{}, preview_{}, download_{}, upload_{}, deleteRemote_{}, localPath_{}, browse_{}, files_{}, content_{}, status_{}, progress_{};
     std::vector<HWND> labels_;
     HFONT font_{};
     std::filesystem::path dataDir_, configFile_, profileFile_;
@@ -143,6 +151,8 @@ private:
     void listPath(const std::string& path);
     void previewSelection();
     void downloadSelection();
+    void uploadFiles();
+    void deleteSelection();
     void selectFolder();
     std::vector<RemoteEntry> selectedEntries() const;
     void showEntries(const std::vector<RemoteEntry>& entries);
@@ -181,6 +191,8 @@ void App::createControls() {
     refresh_ = child(window_, L"BUTTON", L"刷新", BS_PUSHBUTTON, REFRESH);
     preview_ = child(window_, L"BUTTON", L"预览文件", BS_PUSHBUTTON, PREVIEW);
     download_ = child(window_, L"BUTTON", L"下载选中项", BS_PUSHBUTTON, DOWNLOAD);
+    upload_ = child(window_, L"BUTTON", L"上传文件…", BS_PUSHBUTTON, UPLOAD);
+    deleteRemote_ = child(window_, L"BUTTON", L"删除选中项", BS_PUSHBUTTON, DELETE_REMOTE);
     label(L"下载到"); localPath_ = child(window_, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, LOCAL_PATH, WS_EX_CLIENTEDGE);
     browse_ = child(window_, L"BUTTON", L"选择文件夹…", BS_PUSHBUTTON, BROWSE);
     files_ = child(window_, WC_LISTVIEWW, L"", LVS_REPORT | LVS_SHOWSELALWAYS, FILES, WS_EX_CLIENTEDGE);
@@ -194,10 +206,12 @@ void App::createControls() {
                      ES_AUTOHSCROLL | WS_VSCROLL | WS_HSCROLL, CONTENT, WS_EX_CLIENTEDGE);
     SendMessageW(content_, EM_LIMITTEXT, 1024 * 1024, 0);
     status_ = child(window_, L"STATIC", L"填写连接信息，然后点击“连接”。", SS_LEFT | SS_CENTERIMAGE, STATUS);
+    progress_ = child(window_, PROGRESS_CLASSW, L"", PBS_SMOOTH, 0);
+    ShowWindow(progress_, SW_HIDE);
 
     for (HWND control : {profileCombo_, profileName_, saveProfile_, deleteProfile_, host_, port_, user_, password_,
                          connect_, disconnect_, remotePath_, go_, up_, refresh_,
-                         preview_, download_, localPath_, browse_, files_, content_, status_})
+                         preview_, download_, upload_, deleteRemote_, localPath_, browse_, files_, content_, status_})
         SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
     for (HWND control = GetWindow(window_, GW_CHILD); control; control = GetWindow(control, GW_HWNDNEXT))
         SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
@@ -267,18 +281,27 @@ void App::layout(int width, int height) {
     move(remotePath_, margin + 284, y, width - margin - 108 - (margin + 284), row);
     move(go_, width - margin - 100, y, 100, row);
     y += row + gap;
-    move(up_, margin, y, 95, row); move(refresh_, margin + 103, y, 75, row);
-    move(preview_, margin + 186, y, 105, row); move(download_, margin + 299, y, 130, row);
-    move(labels_[7], margin + 441, y, 60, row);
-    move(localPath_, margin + 505, y, width - margin - 138 - (margin + 505), row);
-    move(browse_, width - margin - 130, y, 130, row);
+    int xPos = margin;
+    move(up_, xPos, y, 80, row); xPos += 80 + gap;
+    move(refresh_, xPos, y, 65, row); xPos += 65 + gap;
+    move(preview_, xPos, y, 85, row); xPos += 85 + gap;
+    move(download_, xPos, y, 105, row); xPos += 105 + gap;
+    move(upload_, xPos, y, 95, row); xPos += 95 + gap;
+    move(deleteRemote_, xPos, y, 95, row); xPos += 95 + gap;
+    move(labels_[7], xPos, y, 55, row); xPos += 55 + gap;
+    const int browseWidth = 110;
+    move(browse_, width - margin - browseWidth, y, browseWidth, row);
+    const int localPathWidth = std::max(50, (width - margin - browseWidth - gap) - xPos);
+    move(localPath_, xPos, y, localPathWidth, row);
     y += row + 12;
     const int statusTop = height - margin - statusHeight;
     const int bottom = std::max(y + 100, statusTop - gap);
     const int leftWidth = std::max(220, (contentWidth - gap) * 48 / 100);
     move(files_, margin, y, leftWidth, bottom - y);
     move(content_, margin + leftWidth + gap, y, contentWidth - leftWidth - gap, bottom - y);
-    move(status_, margin, statusTop, contentWidth, statusHeight);
+    const int progressWidth = 200;
+    move(status_, margin, statusTop, contentWidth - progressWidth - gap, statusHeight);
+    move(progress_, margin + contentWidth - progressWidth, statusTop + (statusHeight - 16) / 2, progressWidth, 16);
     HDWP batch = BeginDeferWindowPos(static_cast<int>(positions.size()));
     if (batch) {
         for (const auto& position : positions) {
@@ -305,7 +328,7 @@ void App::updateControls() {
     for (HWND control : {host_, port_, user_}) EnableWindow(control, !busy_ && !connected_);
     for (HWND control : {profileName_, password_, remotePath_, localPath_})
         EnableWindow(control, !busy_);
-    for (HWND control : {go_, up_, refresh_, preview_, download_}) EnableWindow(control, connected_ && !busy_);
+    for (HWND control : {go_, up_, refresh_, preview_, download_, upload_, deleteRemote_}) EnableWindow(control, connected_ && !busy_);
     EnableWindow(browse_, !busy_);
 }
 
@@ -522,6 +545,66 @@ void App::selectFolder() {
     CoTaskMemFree(selection);
 }
 
+void App::uploadFiles() {
+    // Use IFileOpenDialog to allow selecting multiple files AND folders
+    IFileOpenDialog* dialog = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_IFileOpenDialog, reinterpret_cast<void**>(&dialog)))) return;
+    DWORD options = 0;
+    dialog->GetOptions(&options);
+    dialog->SetOptions(options | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+    dialog->SetTitle(L"选择要上传的文件或文件夹");
+    if (FAILED(dialog->Show(window_))) { dialog->Release(); return; }
+
+    IShellItemArray* items = nullptr;
+    if (FAILED(dialog->GetResults(&items))) { dialog->Release(); return; }
+    dialog->Release();
+
+    DWORD count = 0;
+    items->GetCount(&count);
+    std::vector<std::filesystem::path> localPaths;
+    for (DWORD i = 0; i < count; ++i) {
+        IShellItem* item = nullptr;
+        if (FAILED(items->GetItemAt(i, &item))) continue;
+        PWSTR name = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &name))) {
+            localPaths.emplace_back(name);
+            CoTaskMemFree(name);
+        }
+        item->Release();
+    }
+    items->Release();
+
+    if (localPaths.empty()) return;
+    setStatus(L"正在上传…");
+    Request request{Action::Upload};
+    request.path = currentPath_;
+    request.localPaths = std::move(localPaths);
+    enqueue(std::move(request));
+}
+
+void App::deleteSelection() {
+    auto selected = selectedEntries();
+    if (selected.empty()) {
+        MessageBoxW(window_, L"请先选择要删除的文件或文件夹。", L"删除", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    std::wstring prompt;
+    if (selected.size() == 1) {
+        prompt = L"确定要永久删除远端项 “" + wide(selected.front().name) + L"” 吗？\n\n此操作不可恢复。";
+    } else {
+        prompt = L"确定要永久删除选中的 " + std::to_wstring(selected.size()) + L" 项文件/文件夹吗？\n\n此操作不可恢复。";
+    }
+    if (MessageBoxW(window_, prompt.c_str(), L"确认删除", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+    setStatus(L"正在删除…");
+    Request request{Action::Delete};
+    request.path = currentPath_;
+    request.selected = std::move(selected);
+    enqueue(std::move(request));
+}
+
 void App::showEntries(const std::vector<RemoteEntry>& entries) {
     entries_ = entries;
     ListView_DeleteAllItems(files_);
@@ -570,6 +653,7 @@ void App::onResult(std::unique_ptr<Result> result) {
     busy_ = false;
     connected_ = result->connected;
     updateControls();
+    ShowWindow(progress_, SW_HIDE);
     if (!result->ok) {
         if (result->action == Action::Connect) {
             pendingProfile_.reset();
@@ -610,6 +694,14 @@ void App::onResult(std::unique_ptr<Result> result) {
         try { rememberActivePaths(); } catch (...) {}
         MessageBoxW(window_, (L"下载完成，已保存到：\n" + result->local.wstring()).c_str(), L"下载完成", MB_OK | MB_ICONINFORMATION);
         break;
+    case Action::Upload:
+        setStatus(L"上传完成：" + wide(result->path));
+        listPath(currentPath_); // refresh remote directory
+        break;
+    case Action::Delete:
+        setStatus(L"删除完成：" + wide(result->path));
+        listPath(currentPath_); // refresh remote directory
+        break;
     case Action::Disconnect:
         activeProfile_.reset();
         ListView_DeleteAllItems(files_); entries_.clear(); SetWindowTextW(content_, L"");
@@ -649,20 +741,101 @@ void App::work() {
                     break;
                 case Action::List: result->entries = client.list(request.path); break;
                 case Action::Preview: result->data = client.preview(request.path); break;
-                case Action::Download:
+                case Action::Download: {
+                    std::uint64_t totalBytes = 0;
+                    std::uint64_t transferredBytes = 0;
+                    auto* calcProgress = new ProgressData{L"正在计算下载总大小…", 0, 0};
+                    PostMessageW(window_, WM_PROGRESS, 0, reinterpret_cast<LPARAM>(calcProgress));
+                    for (const auto& entry : request.selected) {
+                        if (entry.symlink) continue;
+                        totalBytes += client.calculateSize(remoteJoin(request.path, entry.name), entry.directory);
+                    }
                     std::filesystem::create_directories(request.local);
+                    auto lastPost = std::chrono::steady_clock::time_point{};
                     for (const auto& entry : request.selected) {
                         if (entry.symlink) continue;
                         const auto destination = uniqueLocalPath(request.local / safeLocalName(entry.name));
-                        client.download(remoteJoin(request.path, entry.name), destination, entry.directory, [&](const std::string& message) {
+                        client.download(remoteJoin(request.path, entry.name), destination, entry.directory, [&](const std::string& message, std::uint64_t currentTransferred) {
                             if (stopping_) throw std::runtime_error("Download cancelled because the window is closing.");
-                            auto* progress = new std::wstring(L"正在下载：" + wide(message));
+                            const auto now = std::chrono::steady_clock::now();
+                            if (now - lastPost < std::chrono::milliseconds(30) && currentTransferred < totalBytes) {
+                                return;
+                            }
+                            lastPost = now;
+                            auto* progress = new ProgressData;
+                            progress->message = L"正在下载：" + wide(message);
+                            if (totalBytes > 0) {
+                                int percent = static_cast<int>(std::min<std::uint64_t>(currentTransferred, totalBytes) * 100 / totalBytes);
+                                progress->message += L" · " + std::to_wstring(percent) + L"%";
+                            }
+                            progress->transferred = currentTransferred;
+                            progress->total = totalBytes;
                             if (!PostMessageW(window_, WM_PROGRESS, 0, reinterpret_cast<LPARAM>(progress))) delete progress;
-                        });
+                        }, transferredBytes);
                     }
                     result->path = std::to_string(request.selected.size()) + " 项";
                     result->local = request.local;
                     break;
+                }
+                case Action::Upload: {
+                    // Calculate total local size first
+                    std::uint64_t totalBytes = 0;
+                    for (const auto& lp : request.localPaths) {
+                        std::error_code ec;
+                        if (std::filesystem::is_directory(lp, ec)) {
+                            for (const auto& e : std::filesystem::recursive_directory_iterator(lp, std::filesystem::directory_options::skip_permission_denied, ec)) {
+                                if (e.is_regular_file(ec)) {
+                                    totalBytes += static_cast<std::uint64_t>(e.file_size(ec));
+                                }
+                            }
+                        } else if (std::filesystem::is_regular_file(lp, ec)) {
+                            totalBytes += static_cast<std::uint64_t>(std::filesystem::file_size(lp, ec));
+                        }
+                    }
+                    auto* calcProgress = new ProgressData{L"正在上传…", 0, totalBytes};
+                    PostMessageW(window_, WM_PROGRESS, 0, reinterpret_cast<LPARAM>(calcProgress));
+                    std::uint64_t transferredBytes = 0;
+                    auto lastPost = std::chrono::steady_clock::time_point{};
+                    for (const auto& lp : request.localPaths) {
+                        std::error_code ec;
+                        const auto remoteDest = remoteJoin(request.path, lp.filename().generic_string());
+                        const bool isDir = std::filesystem::is_directory(lp, ec);
+                        client.upload(lp, remoteDest, isDir, [&](const std::string& message, std::uint64_t currentTransferred) {
+                            if (stopping_) throw std::runtime_error("Upload cancelled because the window is closing.");
+                            const auto now = std::chrono::steady_clock::now();
+                            if (now - lastPost < std::chrono::milliseconds(30) && currentTransferred < totalBytes) {
+                                return;
+                            }
+                            lastPost = now;
+                            auto* progress = new ProgressData;
+                            progress->message = L"正在上传：" + wide(message);
+                            if (totalBytes > 0) {
+                                int percent = static_cast<int>(std::min<std::uint64_t>(currentTransferred, totalBytes) * 100 / totalBytes);
+                                progress->message += L" · " + std::to_wstring(percent) + L"%";
+                            }
+                            progress->transferred = currentTransferred;
+                            progress->total = totalBytes;
+                            if (!PostMessageW(window_, WM_PROGRESS, 0, reinterpret_cast<LPARAM>(progress))) delete progress;
+                        }, transferredBytes);
+                    }
+                    result->path = std::to_string(request.localPaths.size()) + " 项";
+                    break;
+                }
+                case Action::Delete: {
+                    std::size_t total = request.selected.size();
+                    std::size_t count = 0;
+                    for (const auto& entry : request.selected) {
+                        if (stopping_) throw std::runtime_error("Delete cancelled because the window is closing.");
+                        auto* progress = new ProgressData;
+                        progress->message = L"正在删除：" + wide(entry.name);
+                        progress->transferred = ++count;
+                        progress->total = total;
+                        if (!PostMessageW(window_, WM_PROGRESS, 0, reinterpret_cast<LPARAM>(progress))) delete progress;
+                        client.remove(remoteJoin(request.path, entry.name), entry.directory && !entry.symlink);
+                    }
+                    result->path = std::to_string(request.selected.size()) + " 项";
+                    break;
+                }
                 case Action::Disconnect: client.disconnect(); break;
                 }
                 result->ok = true;
@@ -709,30 +882,53 @@ LRESULT App::handle(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         case REFRESH: listPath(currentPath_); return 0;
         case PREVIEW: previewSelection(); return 0;
         case DOWNLOAD: downloadSelection(); return 0;
+        case UPLOAD: uploadFiles(); return 0;
+        case DELETE_REMOTE: deleteSelection(); return 0;
         case BROWSE: selectFolder(); return 0;
         default: break;
         }
         return 0;
-    case WM_NOTIFY:
-        if (reinterpret_cast<NMHDR*>(lParam)->idFrom == FILES && reinterpret_cast<NMHDR*>(lParam)->code == NM_DBLCLK) {
-            const auto* info = reinterpret_cast<NMITEMACTIVATE*>(lParam);
-            if (!busy_ && info->iItem >= 0 && static_cast<std::size_t>(info->iItem) < entries_.size()) {
-                const auto& entry = entries_[info->iItem];
-                if (entry.directory) listPath(remoteJoin(currentPath_, entry.name));
-                else if (!entry.symlink) {
-                    setStatus(L"正在读取文件内容…");
-                    enqueue({Action::Preview, {}, remoteJoin(currentPath_, entry.name)});
+    case WM_NOTIFY: {
+        const auto* hdr = reinterpret_cast<NMHDR*>(lParam);
+        if (hdr->idFrom == FILES) {
+            if (hdr->code == NM_DBLCLK) {
+                const auto* info = reinterpret_cast<NMITEMACTIVATE*>(lParam);
+                if (!busy_ && info->iItem >= 0 && static_cast<std::size_t>(info->iItem) < entries_.size()) {
+                    const auto& entry = entries_[info->iItem];
+                    if (entry.directory) listPath(remoteJoin(currentPath_, entry.name));
+                    else if (!entry.symlink) {
+                        setStatus(L"正在读取文件内容…");
+                        enqueue({Action::Preview, {}, remoteJoin(currentPath_, entry.name)});
+                    }
+                }
+                return 0;
+            } else if (hdr->code == LVN_KEYDOWN) {
+                const auto* kd = reinterpret_cast<NMLVKEYDOWN*>(lParam);
+                if (kd->wVKey == VK_DELETE && connected_ && !busy_) {
+                    deleteSelection();
+                    return 0;
                 }
             }
-            return 0;
         }
         break;
+    }
     case WM_HOST_KEY:
         return MessageBoxW(hwnd, reinterpret_cast<const std::wstring*>(lParam)->c_str(),
                            L"验证服务器身份", MB_YESNO | MB_ICONQUESTION);
     case WM_PROGRESS: {
-        std::unique_ptr<std::wstring> progress(reinterpret_cast<std::wstring*>(lParam));
-        setStatus(*progress); return 0;
+        std::unique_ptr<ProgressData> progress(reinterpret_cast<ProgressData*>(lParam));
+        setStatus(progress->message);
+        if (progress->total > 0) {
+            SendMessageW(progress_, PBM_SETRANGE32, 0, 10000);
+            int pos = static_cast<int>(std::min<std::uint64_t>(progress->transferred, progress->total) * 10000 / progress->total);
+            SendMessageW(progress_, PBM_SETPOS, pos, 0);
+            ShowWindow(progress_, SW_SHOW);
+        } else {
+            ShowWindow(progress_, SW_SHOW);
+            SendMessageW(progress_, PBM_SETRANGE32, 0, 10000);
+            SendMessageW(progress_, PBM_SETPOS, 0, 0);
+        }
+        return 0;
     }
     case WM_RESULT: onResult(std::unique_ptr<Result>(reinterpret_cast<Result*>(lParam))); return 0;
     case WM_DESTROY: PostQuitMessage(0); return 0;

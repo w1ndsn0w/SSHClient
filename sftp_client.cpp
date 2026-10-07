@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -212,15 +213,38 @@ std::string SftpClient::preview(const std::string& path, std::size_t limit) {
     return result;
 }
 
+std::uint64_t SftpClient::calculateSize(const std::string& path, bool directory, int depth) {
+    if (!connected()) return 0;
+    if (depth > 64) return 0;
+    if (!directory) {
+        LIBSSH2_SFTP_ATTRIBUTES attrs{};
+        if (libssh2_sftp_stat_ex(sftp(sftp_), path.c_str(), static_cast<unsigned int>(path.size()), LIBSSH2_SFTP_STAT, &attrs) == 0) {
+            return (attrs.flags & LIBSSH2_SFTP_ATTR_SIZE) ? attrs.filesize : 0;
+        }
+        return 0;
+    }
+    std::uint64_t total = 0;
+    try {
+        for (const auto& entry : list(path)) {
+            if (entry.symlink) continue;
+            if (entry.directory) total += calculateSize(remoteJoin(path, entry.name), true, depth + 1);
+            else total += entry.size;
+        }
+    } catch (...) {}
+    return total;
+}
+
 void SftpClient::download(const std::string& remotePath, const std::filesystem::path& localPath,
-                          bool directory, const std::function<void(const std::string&)>& progress) {
+                          bool directory, const std::function<void(const std::string&, std::uint64_t)>& progress,
+                          std::uint64_t& transferredBytes) {
     if (!connected()) throw std::runtime_error("Not connected.");
-    if (directory) downloadDirectory(remotePath, localPath, progress, 0);
-    else downloadFile(remotePath, localPath, progress);
+    if (directory) downloadDirectory(remotePath, localPath, progress, transferredBytes, 0);
+    else downloadFile(remotePath, localPath, progress, transferredBytes);
 }
 
 void SftpClient::downloadFile(const std::string& remotePath, const std::filesystem::path& localPath,
-                              const std::function<void(const std::string&)>& progress) {
+                              const std::function<void(const std::string&, std::uint64_t)>& progress,
+                              std::uint64_t& transferredBytes) {
     LIBSSH2_SFTP_HANDLE* handle = libssh2_sftp_open(sftp(sftp_), remotePath.c_str(), LIBSSH2_FXF_READ, 0);
     if (!handle) throw std::runtime_error(lastError(session(session_), "Could not open remote file"));
     const auto partPath = uniqueLocalPath(std::filesystem::path(localPath.wstring() + L".part"));
@@ -228,19 +252,21 @@ void SftpClient::downloadFile(const std::string& remotePath, const std::filesyst
         std::ofstream output(partPath, std::ios::binary | std::ios::trunc);
         if (!output) throw std::runtime_error("Could not create local file.");
         std::array<char, 64 * 1024> buffer{};
-        std::uint64_t total = 0;
-        progress(remotePath);
+        std::uint64_t fileTransferred = 0;
+        progress(remotePath, transferredBytes);
         while (true) {
             const auto count = libssh2_sftp_read(handle, buffer.data(), buffer.size());
             if (count < 0) throw std::runtime_error("Remote file read failed.");
             if (count == 0) break;
             output.write(buffer.data(), count);
             if (!output) throw std::runtime_error("Local file write failed.");
-            total += static_cast<std::uint64_t>(count);
-            if (total % (1024 * 1024) < buffer.size()) progress(remotePath + " (" + std::to_string(total / 1024) + " KB)");
+            fileTransferred += static_cast<std::uint64_t>(count);
+            transferredBytes += static_cast<std::uint64_t>(count);
+            progress(remotePath + " (" + std::to_string(fileTransferred / 1024) + " KB)", transferredBytes);
         }
         output.close();
         if (!output) throw std::runtime_error("Could not finish local file.");
+        progress(remotePath + " (" + std::to_string(fileTransferred / 1024) + " KB)", transferredBytes);
         libssh2_sftp_close(handle);
         handle = nullptr;
         std::filesystem::rename(partPath, localPath);
@@ -253,15 +279,109 @@ void SftpClient::downloadFile(const std::string& remotePath, const std::filesyst
 }
 
 void SftpClient::downloadDirectory(const std::string& remotePath, const std::filesystem::path& localPath,
-                                   const std::function<void(const std::string&)>& progress, int depth) {
+                                   const std::function<void(const std::string&, std::uint64_t)>& progress,
+                                   std::uint64_t& transferredBytes, int depth) {
     if (depth > 64) throw std::runtime_error("Folder nesting exceeds the 64-level safety limit.");
     std::filesystem::create_directories(localPath);
     for (const auto& entry : list(remotePath)) {
         const auto childRemote = remoteJoin(remotePath, entry.name);
-        if (entry.symlink) { progress("Skipped symbolic link: " + childRemote); continue; }
+        if (entry.symlink) { progress("Skipped symbolic link: " + childRemote, transferredBytes); continue; }
         const auto childLocal = uniqueLocalPath(localPath / safeLocalName(entry.name));
-        if (entry.directory) downloadDirectory(childRemote, childLocal, progress, depth + 1);
-        else downloadFile(childRemote, childLocal, progress);
+        if (entry.directory) downloadDirectory(childRemote, childLocal, progress, transferredBytes, depth + 1);
+        else downloadFile(childRemote, childLocal, progress, transferredBytes);
+    }
+}
+
+// --- Upload ---
+
+void SftpClient::upload(const std::filesystem::path& localPath, const std::string& remotePath,
+                        bool directory, const std::function<void(const std::string&, std::uint64_t)>& progress,
+                        std::uint64_t& transferredBytes) {
+    if (!connected()) throw std::runtime_error("Not connected.");
+    if (directory) uploadDirectory(localPath, remotePath, progress, transferredBytes, 0);
+    else uploadFile(localPath, remotePath, progress, transferredBytes);
+}
+
+void SftpClient::uploadFile(const std::filesystem::path& localPath, const std::string& remotePath,
+                             const std::function<void(const std::string&, std::uint64_t)>& progress,
+                             std::uint64_t& transferredBytes) {
+    std::ifstream input(localPath, std::ios::binary);
+    if (!input) throw std::runtime_error("Could not open local file: " + localPath.string());
+
+    const long flags = LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC;
+    LIBSSH2_SFTP_HANDLE* handle = libssh2_sftp_open(sftp(sftp_), remotePath.c_str(), flags, 0644);
+    if (!handle) throw std::runtime_error(lastError(session(session_), "Could not create remote file " + remotePath));
+
+    try {
+        std::array<char, 64 * 1024> buffer{};
+        std::uint64_t fileTransferred = 0;
+        const auto localName = localPath.filename().generic_string();
+        progress(localName, transferredBytes);
+        while (input) {
+            input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            const auto count = static_cast<std::size_t>(input.gcount());
+            if (count == 0) break;
+            std::size_t sent = 0;
+            while (sent < count) {
+                const auto written = libssh2_sftp_write(handle, buffer.data() + sent, count - sent);
+                if (written < 0) throw std::runtime_error("Remote file write failed for: " + remotePath);
+                sent += static_cast<std::size_t>(written);
+            }
+            fileTransferred += count;
+            transferredBytes += count;
+            progress(localName + " (" + std::to_string(fileTransferred / 1024) + " KB)", transferredBytes);
+        }
+        progress(localName + " (" + std::to_string(fileTransferred / 1024) + " KB)", transferredBytes);
+        libssh2_sftp_close(handle);
+        handle = nullptr;
+    } catch (...) {
+        if (handle) libssh2_sftp_close(handle);
+        throw;
+    }
+}
+
+void SftpClient::uploadDirectory(const std::filesystem::path& localPath, const std::string& remotePath,
+                                  const std::function<void(const std::string&, std::uint64_t)>& progress,
+                                  std::uint64_t& transferredBytes, int depth) {
+    if (depth > 64) throw std::runtime_error("Folder nesting exceeds the 64-level safety limit.");
+    // Create remote directory; ignore error if it already exists
+    libssh2_sftp_mkdir(sftp(sftp_), remotePath.c_str(), 0755);
+    for (const auto& entry : std::filesystem::directory_iterator(localPath)) {
+        const auto& childLocal = entry.path();
+        const auto childRemote = remoteJoin(remotePath, childLocal.filename().generic_string());
+        std::error_code ec;
+        if (entry.is_symlink(ec)) continue;
+        if (entry.is_directory(ec)) uploadDirectory(childLocal, childRemote, progress, transferredBytes, depth + 1);
+        else if (entry.is_regular_file(ec)) uploadFile(childLocal, childRemote, progress, transferredBytes);
+    }
+}
+
+// --- Delete ---
+
+void SftpClient::remove(const std::string& remotePath, bool directory) {
+    if (!connected()) throw std::runtime_error("Not connected.");
+    if (directory) removeDirectory(remotePath, 0);
+    else removeFile(remotePath);
+}
+
+void SftpClient::removeFile(const std::string& remotePath) {
+    if (libssh2_sftp_unlink(sftp(sftp_), remotePath.c_str()) != 0) {
+        throw std::runtime_error(lastError(session(session_), "Could not delete remote file " + remotePath));
+    }
+}
+
+void SftpClient::removeDirectory(const std::string& remotePath, int depth) {
+    if (depth > 64) throw std::runtime_error("Folder nesting exceeds the 64-level safety limit.");
+    for (const auto& entry : list(remotePath)) {
+        const auto childRemote = remoteJoin(remotePath, entry.name);
+        if (entry.directory && !entry.symlink) {
+            removeDirectory(childRemote, depth + 1);
+        } else {
+            removeFile(childRemote);
+        }
+    }
+    if (libssh2_sftp_rmdir(sftp(sftp_), remotePath.c_str()) != 0) {
+        throw std::runtime_error(lastError(session(session_), "Could not delete remote directory " + remotePath));
     }
 }
 

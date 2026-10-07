@@ -1,5 +1,5 @@
 #define AppName "SSHClient"
-#define AppVersion "0.1.1"
+#define AppVersion "0.3"
 #define BuildDir "..\cmake-build-release"
 
 [Setup]

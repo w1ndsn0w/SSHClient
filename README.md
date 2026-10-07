@@ -1,6 +1,6 @@
-# SSHClient 初版
+# SSHClient
 
-这是一个 Windows 桌面 SFTP 客户端，使用 C++20、Win32 和 libssh2。可以填写 SSH 地址、端口、用户名和密码，浏览远端目录，预览 UTF-8 文本文件，并将选中的文件或文件夹下载到本地。
+这是一个 Windows 桌面 SFTP 客户端，使用 C++20、Win32 和 libssh2。可以填写 SSH 地址、端口、用户名和密码，浏览远端目录，预览 UTF-8 文本文件，下载远端文件/文件夹，上传本地文件/文件夹，以及删除远端选中项。
 
 ## 界面预览
 
@@ -22,10 +22,10 @@
 
 目录可双击进入，也可在“远端路径”输入绝对路径后点击“打开路径”。文件可双击或点击“预览文件”；预览最多读取前 256 KiB，并要求内容是 UTF-8 文本。可多选文件及文件夹后点击“下载选中项”。下载会为已有同名文件或文件夹选择新名称，正在下载的文件先写入 `.part` 临时文件，成功后改为正式名称。符号链接不会被跟随或下载。
 
-当前版本仅支持密码认证和下载，不包含上传、修改远端文件或断点续传。连接服务器并实际下载需要有效的服务器密码。
+当前版本支持密码认证、下载、上传文件/文件夹及删除远端文件/目录。连接服务器并实际操作需要有效的服务器密码。
 
 ## 安装包
 
-在安装了 CLion MinGW 工具链和 Inno Setup 7 的 Windows 上运行 `tools/build-package.ps1`，会创建 Release 构建并输出 `dist/SSHClient-Setup-0.1.1.exe`。安装程序面向当前用户，默认安装在 `%LOCALAPPDATA%\Programs\SSHClient`，可在 Windows“已安装的应用”中卸载。
+在安装了 CLion MinGW 工具链和 Inno Setup 7 的 Windows 上运行 `tools/build-package.ps1`，会创建 Release 构建并输出 `dist/SSHClient-Setup-0.3.exe`。安装程序面向当前用户，默认安装在 `%LOCALAPPDATA%\Programs\SSHClient`，可在 Windows“已安装的应用”中卸载。
 
 卸载时会删除安装的程序文件、运行时 DLL、快捷方式和 `%APPDATA%\SSHClient` / `%LOCALAPPDATA%\SSHClient` 下的所有程序配置记录，包括服务器列表、最近设置和已接受的主机密钥。用户自行选择目录下载的文件属于用户数据，不会被卸载程序删除。

@@ -63,4 +63,4 @@ foreach ($item in $licenseFiles) {
 
 & $InnoCompilerPath (Join-Path $projectRoot 'installer\SSHClient.iss')
 if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed.' }
-Write-Output "Package ready: $(Join-Path $projectRoot 'dist\SSHClient-Setup-0.1.1.exe')"
+Write-Output "Package ready: $(Join-Path $projectRoot 'dist\SSHClient-Setup-0.3.exe')"
